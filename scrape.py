@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """Archive all series/episodes from dererhuligennem.dk.
 
-Files mirror the imgix storage paths under OUT/, e.g.
+Files mirror the imgix storage paths under the output folder, e.g.
   audio/<serie>/[<season>/]<episode>-XXXX.mp3  + .json (episode metadata;
                                                episodic series have no season dir)
   images/series/...jpg                       (posters)
   serier/<slug>.json                         (raw page data per series)
 
-Usage: uv run scrape.py [--no-media] [--workers N]
+Usage: uv run scrape.py [--all | --tui] [--out DIR] [--no-media] [--workers N]
+
+No mode flag opens the GUI (pick series and folder, then Start).
+--all archives everything with console progress; --tui picks series in the
+terminal first.
 
 Metadata is fetched first (sequentially), then media downloads run on
 N parallel workers (default 4).
 
 Resumable: the filesystem is the progress log. Finished files have their
 final name and are skipped; interrupted downloads stay as *.part and are
-continued with an HTTP Range request. Ctrl-C any time, rerun to resume.
+continued with an HTTP Range request. Stop any time, rerun to resume.
 """
-import argparse, html, json, os, re, sys, time, urllib.error, urllib.request
+import argparse, functools, html, json, os, re, sys, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -26,9 +30,11 @@ from rich.progress import (BarColumn, DownloadColumn, Progress, TaskProgressColu
                            TextColumn, TimeRemainingColumn, TransferSpeedColumn, track)
 
 SITE = "https://dererhuligennem.dk"
-OUT = Path("archive")
 DELAY = 0.2  # seconds before each request, be polite
 UA = "huligennem-archiver"
+FROZEN = getattr(sys, "frozen", False)  # running as a PyInstaller executable
+# A double-clicked app starts in an arbitrary folder (/ on macOS), so use home.
+DEFAULT_OUT = Path.home() / "huligennem-archive" if FROZEN else Path("archive")
 
 
 def get(url, headers={}):
@@ -37,15 +43,28 @@ def get(url, headers={}):
     return urllib.request.urlopen(req, timeout=60)
 
 
+@functools.cache
 def inertia_version():
     page = get(SITE + "/").read().decode()
     data = re.search(r'data-page="([^"]*)"', page).group(1)
     return json.loads(html.unescape(data))["version"]
 
 
-def series_slugs():
-    xml = get(SITE + "/series/sitemap.xml").read().decode()
-    return re.findall(r"<loc>" + re.escape(SITE) + r"/serier/([^<]+)</loc>", xml)
+def inertia(url):
+    """A page's data as JSON (Inertia.js answers with props instead of HTML)."""
+    headers = {"X-Inertia": "true", "X-Inertia-Version": inertia_version(),
+               "X-Requested-With": "XMLHttpRequest"}
+    return json.load(get(url, headers))["props"]
+
+
+def series_index():
+    """{slug: title} for every series, from the paginated /serier listing."""
+    out, url = {}, SITE + "/serier"
+    while url:
+        page = inertia(url)["series"]
+        out.update((s["slug"], s["title"]) for s in page["data"])
+        url = page["next_page_url"]
+    return out
 
 
 def media(obj):
@@ -80,10 +99,10 @@ def write_json(path, obj):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
-def download(storage_path, url, report=lambda n, total: None):
+def download(storage_path, url, out, report=lambda n, total: None):
     """report(nbytes, total) is called as bytes arrive (incl. already-had bytes);
     total is None when the server doesn't say."""
-    dest = OUT / storage_path
+    dest = out / storage_path
     if dest.exists():
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -112,82 +131,130 @@ def download(storage_path, url, report=lambda n, total: None):
     tmp.rename(dest)  # only complete files get the real name
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--no-media", action="store_true")
-    ap.add_argument("--workers", type=int, default=4)
-    args = ap.parse_args()
-    version = inertia_version()
-    headers = {"X-Inertia": "true", "X-Inertia-Version": version,
-               "X-Requested-With": "XMLHttpRequest"}
-    failures, jobs, seconds = [], {}, {}
-    for slug in track(series_slugs(), description="Fetching metadata"):
-        try:
-            props = json.load(get(f"{SITE}/serier/{slug}", headers))["props"]
-        except Exception as e:
-            failures.append((slug, repr(e)))
+def fetch_series(slug, out):
+    """Fetch one series and write its metadata files.
+    Returns ({storage_path: url} for all its media, {audio path: minutes})."""
+    props = inertia(f"{SITE}/serier/{slug}")
+    serie, seasons = props["serie"], props["data"]
+    write_json(out / "serier" / f"{slug}.json", {"serie": serie, "seasons": seasons})
+    minutes = {}
+    for ep, season_info in episodes(slug, seasons):
+        audio = (ep.get("audio") or {}).get("storage_path")
+        if not audio:
+            print(f"WARN {slug} episode {ep['id']} has no audio")
             continue
-        serie, seasons = props["serie"], props["data"]
-        write_json(OUT / "serier" / f"{slug}.json", {"serie": serie, "seasons": seasons})
+        minutes[audio] = (ep["audio"].get("length_in_seconds") or 0) / 60
+        write_json((out / audio).with_suffix(".json"), {**ep, "season": season_info, "serie": serie})
+    return dict(media(props)), minutes
 
-        for ep, season_info in episodes(slug, seasons):
-            audio = (ep.get("audio") or {}).get("storage_path")
-            if not audio:
-                print(f"WARN {slug} episode {ep['id']} has no audio")
-                continue
-            seconds[audio] = ep["audio"].get("length_in_seconds") or 0
-            meta = {**ep, "season": season_info, "serie": serie}
-            write_json((OUT / audio).with_suffix(".json"), meta)
 
-        jobs.update(media(props))
-
-    todo = {p: u for p, u in jobs.items() if not (OUT / p).exists()}
-    print(f"{len(jobs)} media files, {len(todo)} to download")
-    if args.no_media:
-        return
-
-    # Overall progress is weighted by audio duration: % of the archive's hours.
-    overall = Progress(TextColumn("{task.description}"), BarColumn(), TaskProgressColumn(),
-                       TextColumn("{task.completed:,.0f}/{task.total:,.0f} min"),
-                       TimeRemainingColumn())
-    files = Progress(TextColumn("  {task.description}", style="dim"), BarColumn(),
-                     DownloadColumn(), TransferSpeedColumn())
-    minutes = {p: s / 60 for p, s in seconds.items()}
-    total_min = sum(minutes.values())
-    done_min = sum(m for p, m in minutes.items() if p not in todo)
-    archive = overall.add_task(f"Archive {len(jobs) - len(todo)}/{len(jobs)} files", total=total_min, completed=done_min)
-    n_done = len(jobs) - len(todo)
-
+def run_downloads(todo, out, workers, minutes, ui):
+    """Download {path: url} on parallel workers, reporting to ui (console or GUI):
+    ui.start(path), ui.bytes(path, n, total), ui.minutes(m) to advance the
+    overall bar (weighted by audio duration), ui.end(path, error or None)."""
     def fetch(path, url):
-        tid = files.add_task(Path(path).name, total=None)
+        ui.start(path)
         credited = 0
         def report(n, total):
             nonlocal credited
-            files.update(tid, total=total, advance=n)
+            ui.bytes(path, n, total)
             if total:
                 share = minutes.get(path, 0) * n / total
                 credited += share
-                overall.advance(archive, share)
-        try:
-            download(path, url, report)
-            overall.advance(archive, minutes.get(path, 0) - credited)  # sizeless downloads
-        finally:
-            files.remove_task(tid)
+                ui.minutes(share)
+        download(path, url, out, report)
+        ui.minutes(minutes.get(path, 0) - credited)  # sizeless downloads
 
-    with Live(Group(overall, files), refresh_per_second=4) as live:
-        pool = ThreadPoolExecutor(args.workers)
-        futures = {pool.submit(fetch, p, u): p for p, u in todo.items()}
+    pool = ThreadPoolExecutor(workers)
+    futures = {pool.submit(fetch, p, u): p for p, u in todo.items()}
+    for fut in as_completed(futures):
+        ui.end(futures[fut], fut.exception())
+
+
+class ConsoleUI:
+    """rich progress: one overall bar plus one bar per active download."""
+
+    def __init__(self, n_files, n_done, total_min, done_min):
+        self.overall = Progress(TextColumn("{task.description}"), BarColumn(), TaskProgressColumn(),
+                                TextColumn("{task.completed:,.0f}/{task.total:,.0f} min"),
+                                TimeRemainingColumn())
+        self.files = Progress(TextColumn("  {task.description}", style="dim"), BarColumn(),
+                              DownloadColumn(), TransferSpeedColumn())
+        self.n_files, self.n_done = n_files, n_done
+        self.archive = self.overall.add_task(self.label(), total=total_min, completed=done_min)
+        self.tasks, self.failures = {}, []
+        self.live = Live(Group(self.overall, self.files), refresh_per_second=4)
+
+    def label(self):
+        return f"Archive {self.n_done}/{self.n_files} files"
+
+    def start(self, path):
+        self.tasks[path] = self.files.add_task(Path(path).name, total=None)
+
+    def bytes(self, path, n, total):
+        self.files.update(self.tasks[path], total=total, advance=n)
+
+    def minutes(self, m):
+        self.overall.advance(self.archive, m)
+
+    def end(self, path, error):
+        if path in self.tasks:
+            self.files.remove_task(self.tasks.pop(path))
+        self.n_done += 1
+        self.overall.update(self.archive, description=self.label())
+        if error:
+            self.failures.append((path, repr(error)))
+            self.live.console.print(f"[red]FAILED[/] {path} {error!r}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Archive dererhuligennem.dk. "
+                                 "Without --all or --tui, opens the GUI.")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--all", action="store_true", help="archive every series, console only")
+    mode.add_argument("--tui", action="store_true", help="pick series in the terminal first")
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"archive folder (default: {DEFAULT_OUT})")
+    ap.add_argument("--no-media", action="store_true", help="metadata only (--all/--tui)")
+    ap.add_argument("--workers", type=int, default=4, help="parallel downloads (default: 4)")
+    args = ap.parse_args()
+    if not (args.all or args.tui):
+        from gui import run_gui  # only load DearPyGui when needed
+        return run_gui(args.out, args.workers)
+
+    out = args.out
+    print(f"Archiving to {out.resolve()}")
+    series = series_index()
+    if args.tui:
+        from picker import pick  # only load Textual when needed
+        chosen = pick(series)
+        if not chosen:
+            print("Nothing selected.")
+            return
+        series = {slug: series[slug] for slug in chosen}
+
+    failures, jobs, minutes = [], {}, {}
+    for slug in track(series, description="Fetching metadata"):
         try:
-            for fut in as_completed(futures):
-                n_done += 1
-                overall.update(archive, description=f"Archive {n_done}/{len(jobs)} files")
-                if e := fut.exception():
-                    failures.append((futures[fut], repr(e)))
-                    live.console.print(f"[red]FAILED[/] {futures[fut]} {e!r}")
-        except KeyboardInterrupt:
-            live.stop()
-            print("Interrupted; rerun to resume.")
-            os._exit(130)  # skip waiting on workers; *.part files resume next run
+            files, mins = fetch_series(slug, out)
+        except Exception as e:
+            failures.append((slug, repr(e)))
+            continue
+        jobs.update(files)
+        minutes.update(mins)
+
+    todo = {p: u for p, u in jobs.items() if not (out / p).exists()}
+    print(f"{len(jobs)} media files, {len(todo)} to download")
+    if not args.no_media:
+        done_min = sum(m for p, m in minutes.items() if p not in todo)
+        ui = ConsoleUI(len(jobs), len(jobs) - len(todo), sum(minutes.values()), done_min)
+        with ui.live:
+            try:
+                run_downloads(todo, out, args.workers, minutes, ui)
+            except KeyboardInterrupt:
+                ui.live.stop()
+                print("Interrupted; rerun to resume.")
+                os._exit(130)  # skip waiting on workers; *.part files resume next run
+        failures += ui.failures
 
     for what, err in failures:
         print("FAILED", what, err)

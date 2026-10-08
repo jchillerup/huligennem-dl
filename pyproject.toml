@@ -1,0 +1,10 @@
+[project]
+name = "huligennem"
+version = "0.1.0"
+description = "Archive every podcast episode and its metadata from dererhuligennem.dk"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=15.0.0",
+]
